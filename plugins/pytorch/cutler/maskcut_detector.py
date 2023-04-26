@@ -173,7 +173,7 @@ class MaskCutDetector( ImageObjectDetector ):
             [tl_x, tl_y, w, h] = np.array(annotation_info["bbox"]).astype( np.int32 ) # xywh
             bounding_box = BoundingBoxD( tl_x, tl_y, tl_x + w, tl_y + h ) # tlbr
             
-            label = "maskcut"
+            label = "fg"
             class_confidence = 1
             detected_object_type = DetectedObjectType( label, class_confidence )
 
