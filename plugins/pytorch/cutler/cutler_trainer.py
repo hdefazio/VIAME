@@ -29,32 +29,34 @@
 from __future__ import print_function
 from __future__ import division
 
-import numpy as np
 import torch
 import pickle
 import os
+import copy
 import signal
 import sys
 import time
 import yaml
 import mmcv
 
+import numpy as np
+import ubelt as ub
+
 from collections import namedtuple
 from PIL import Image
 from distutils.util import strtobool
 from shutil import copyfile
+from pathlib import Path
 
 from kwiver.vital.algo import DetectedObjectSetOutput, TrainDetector
 from kwiver.vital.types import (
     BoundingBoxD, CategoryHierarchy, DetectedObject, DetectedObjectSet,
 )
 
-from learn.algorithms.CutLER.pretrain_algo import PretrainAlgo
-
 
 _Option = namedtuple('_Option', ['attr', 'config', 'default', 'parse', 'help'])
 
-
+learn_dir = '/home/local/KHQ/hannah.defazio/projects/LEARN/VIAME/src/packages/learn' # TODO: get this from env vars? 
 class CutLERTrainer( TrainDetector ):
     """
     Implementation of TrainDetector class
@@ -64,7 +66,7 @@ class CutLERTrainer( TrainDetector ):
         _Option('_gpu_count', 'gpu_count', -1, int, ''),
         _Option('_launcher', 'launcher', 'pytorch', str, ''), # "none, pytorch, slurm, or mpi" 
         
-        _Option('_config_file', 'config_file', '', str, ''),
+        _Option('_config_file', 'config_file', f'{learn_dir}/configs/hydra_config/self_supervision_pretrain/CutLER.yaml', str, ''),
 
         _Option('_output_directory', 'output_directory', '', str, '')
     ]
@@ -75,8 +77,7 @@ class CutLERTrainer( TrainDetector ):
         for opt in self._options:
             setattr(self, opt.attr, opt.default)
 
-        #self.config = yaml.safe_load(self._config_file)
-        #print('config:', self.config)
+        self.image_root = ''
 
     def get_configuration( self ):
         # Inherit from the base class
@@ -93,38 +94,169 @@ class CutLERTrainer( TrainDetector ):
         for opt in self._options:
             setattr(self, opt.attr, opt.parse(cfg.get_value(opt.config)))
 
-        """
-        # ============================
-        self.toolset = 
-        register_new_losses()
+        config_file = yaml.safe_load(Path(self._config_file).read_text())
+        self.config = config_file['params']
+        print('config:', self.config)
 
-        mmdet_config_path = os.path.join(get_original_cwd(), './learn/algorithms/MMDET/configs/'+self.config["mmdet_model_config_file"])
-        coco_data_path = os.path.join(top_data_dir, f"annotations/{self.toolset['stage']}_maskcut_annotations.json")
+        device = self.config['device']
+        if ub.iterable(device):
+            self.device = device
+        else:
+            if device == -1:
+                self.device = list(range(torch.cuda.device_count()))
+            else:
+                self.device = [device]
+        if len(self.device) > torch.cuda.device_count():
+            self.device = self.device[:torch.cuda.device_count()]
+            
+        if self.config["checkpoint_override"] is not None:
+            original_chkpt_file = self.config["checkpoint_override"]
+        else:
+            original_chkpt_file = self.config["model_checkpoint_file"]
+            
+        if config_file["name"] == "CutLER/pretrain_algo.py":
+                if os.path.exists(str(os.path.join(self.config["work_dir"], "pretrain.pth"))):
+                    original_chkpt_file = os.path.join(self.config["work_dir"], "pretrain.pth")
+        print(f"Found CutLER weights at {original_chkpt_file}")
 
-        self.mmdet_config = self.set_config(mmdet_config_path, coco_data_path, train_image_dir)
-        self.mmdet_config.work_dir = self.work_dir
 
-        print(f'Config:\n{self.mmdet_config.pretty_text}')
 
-        self.original_chkpt_file = str(os.path.join(self.toolset['protocol_config']['domain_network_selector']['params']["pretrained_network_dir"],
-            self.config["model_checkpoint_file"]))
 
-        seed = self.config["seed"]
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        self.mmdet_config.seed = seed
-
-        replace(self.mmdet_config, 500)
-        """
+    def set_mmdet_config(self):
+        print('set_mmdet_config')
+        # based on: https://gitlab.kitware.com/darpa_learn/learn/-/blob/object_detection_2023/learn/algorithms/MMDET/object_detection.py#L478
+        # make sure this runs after add_data_from_disk
+        mmdet_config = mmcv.Config.fromfile(f'{learn_dir}/learn/algorithms/MMDET/configs/convnext_extra_large_config.py')
+        mmdet_config.dataset_type = 'CocoDataset'
         
+        mmdet_config.data_root = self.image_root
+        mmdet_config.data.ann_file = str(os.path.join(self.config["work_dir"], 'train_data_coco.json'))
         
+        mmdet_config.classes = ("maskcut", ) # default class from maskcut
+
+        # print(type(mmdet_config)) # <class 'mmcv.utils.config.Config'>
+
+        if mmdet_config.data.train.type == "RepeatDataset":
+            print('using RepeatDataset')
+            if self.config["use_class_balanced"] and mmdet_config.data.train.dataset.type != 'ClassBalancedDataset':
+                mmdet_config.data.train.dataset.type = 'CocoDataset'
+                mmdet_config.data.train.dataset.data_root = self.image_root
+                mmdet_config.data.train.dataset.ann_file = str(os.path.join(self.config["work_dir"], 'train_data_coco.json'))
+                mmdet_config.data.train.dataset.img_prefix = self.image_root
+                mmdet_config.data.train.dataset.classes = mmdet_config.classes
+
+                data = copy.deepcopy(mmdet_config.data.train.dataset)
+                mmdet_config.data.train.dataset = dict(
+                    type='ClassBalancedDataset',
+                    oversample_thr=self.config["oversample_thr"],
+                    dataset=data)
+            elif self.config["use_class_balanced"]:
+                mmdet_config.data.train.dataset.dataset.type = 'CocoDataset'
+                mmdet_config.data.train.dataset.dataset.data_root = self.image_root
+                mmdet_config.data.train.dataset.dataset.ann_file = str(os.path.join(self.config["work_dir"], 'train_data_coco.json'))
+                mmdet_config.data.train.dataset.dataset.img_prefix = self.image_root
+                mmdet_config.data.train.dataset.dataset.classes = mmdet_config.classes
+            else:
+                mmdet_config.data.train.dataset.type = 'CocoDataset'
+                mmdet_config.data.train.dataset.data_root = self.image_root
+                mmdet_config.data.train.dataset.ann_file = os.path.join(self.config["work_dir"], 'train_data_coco.json')
+                mmdet_config.data.train.dataset.img_prefix = self.image_root
+                mmdet_config.data.train.dataset.classes = mmdet_config.classes
+        elif mmdet_config.data.train.type == 'ClassBalancedDataset' and self.config["use_class_balanced"]:
+            print('using ClassBalancedDataset')
+            mmdet_config.data.train.oversample_thr = self.config["oversample_thr"]
+            mmdet_config.data.train.dataset.type = 'CocoDataset'
+            mmdet_config.data.train.dataset.data_root = self.image_root
+            mmdet_config.data.train.dataset.ann_file = str(os.path.join(self.config["work_dir"], 'train_data_coco.json'))
+            mmdet_config.data.train.dataset.img_prefix = self.image_root
+            mmdet_config.data.train.dataset.classes = mmdet_config.classes
+        else:
+            mmdet_config.data.train.type = 'CocoDataset'
+            mmdet_config.data.train.data_root = self.image_root
+            mmdet_config.data.train.ann_file = str(os.path.join(self.config["work_dir"], 'train_data_coco.json'))
+            mmdet_config.data.train.img_prefix = self.image_root
+            mmdet_config.data.train.classes = mmdet_config.classes # tuple(train_dataset.category_to_category_index.values())
+
+            if self.config["use_class_balanced"]:
+                data = copy.deepcopy(mmdet_config.data.train)
+                mmdet_config.data.train = dict(
+                    type='ClassBalancedDataset',
+                    oversample_thr=self.config["oversample_thr"],
+                    dataset=data)
+                
+        mmdet_config.data.val.type = 'CocoDataset'
+        mmdet_config.data.val.data_root = self.image_root
+        mmdet_config.data.val.ann_file = str(os.path.join(self.config["work_dir"], 'train_data_coco.json'))
+        mmdet_config.data.val.img_prefix = self.image_root
+        mmdet_config.data.val.classes = mmdet_config.classes # tuple(train_dataset.category_to_category_index.values())
+
+        mmdet_config.data.test.type = 'CocoDataset'
+        mmdet_config.data.test.data_root = self.image_root  # change back to test??
+        mmdet_config.data.test.ann_file = str(os.path.join(self.config["work_dir"], 'train_data_coco.json'))
+        mmdet_config.data.test.img_prefix = self.image_root
+        mmdet_config.data.test.classes = mmdet_config.classes
+
+        mmdet_config.log_config.interval = self.config["log_interval"]
+        mmdet_config.checkpoint_config.interval = self.config["checkpoint_interval"]
+        mmdet_config.data.samples_per_gpu = self.config["batch_size"]  # Batch size
+        mmdet_config.gpu_ids = self.device
+        mmdet_config.device = 'cuda'
+        mmdet_config.work_dir = self.config["work_dir"]
+
+        ckpt = 0 # TODO: not sure about this
+        stage = 'base' # TODO: also not sure about this 
+        if stage == "adapt":
+            if len(self.config["iters_per_ckpt_adapt"]) > 0 and ckpt < len(self.config["iters_per_ckpt_adapt"]):
+                num_iter = self.config["iters_per_ckpt_adapt"][ckpt]
+            else:
+                num_iter = self.config["max_iters"]
+        else:    
+            if len(self.config["iters_per_ckpt"]) > 0 and ckpt < len(self.config["iters_per_ckpt"]):
+                num_iter = self.config["iters_per_ckpt"][ckpt]
+            else:
+                num_iter = self.config["max_iters"]
+
+        mmdet_config.lr_config.warmup_iters = 1 if self.config["warmup_iters"] >= num_iter else self.config["warmup_iters"]
+        mmdet_config.lr_config.step = [step for step in self.config["lr_steps"] if step < num_iter]
+        mmdet_config.runner = {'type': 'IterBasedRunner', 'max_iters': num_iter}
+        mmdet_config.optimizer.lr = self.config["lr"]
+
+        # loop over config, and if there are any num_classes, replace it
+        # there might be problems with this (i.e. won't work with nested lists)
+        # but I think it's fine for mmdet's config structure
+        def replace(conf, depth):
+            if depth <= 0:
+                return
+            try:
+                for k,v in conf.items():
+                    if isinstance(v, dict):
+                        replace(v, depth-1)
+                    elif isinstance(v, list):
+                        for element in v:
+                            replace(element, depth-1)
+                    else:
+                        # print(k,v)
+                        if k == 'num_classes':
+                            conf[k] = len(self.toolset["target_dataset"].categories)
+                        if k == 'CLASSES':
+                            conf[k] = self.toolset['target_dataset'].categories
+            except:
+                pass
+
+        replace(mmdet_config, 500)
+        print(f'mmdet Config:\n{mmdet_config.pretty_text}')
+
+        mmdet_config.dump(str(os.path.join(self.config["work_dir"], 'mmdet_config.py')))
+        self.mmdet_config = mmdet_config
+
+
+
     def check_configuration( self, cfg ):
         return True
         if not cfg.has_value( "config_file" ) or len( cfg.get_value( "config_file") ) == 0:
             print( "A config file must be specified!" )
             return False
+
 
     def load_network( self ):
         """
@@ -186,6 +318,8 @@ class CutLERTrainer( TrainDetector ):
 
             for index in range(num_images):
                 filename = split[index]
+                if not self.image_root:
+                    self.image_root = os.path.dirname(filename) # TODO: there might be a better way to get this?
                 img = mmcv.image.imread(filename)
                 height, width = img.shape[:2]
                 targets = train_dets[index] if is_train else test_dets[index]
@@ -235,15 +369,16 @@ class CutLERTrainer( TrainDetector ):
                 categories=cats)
 
             fn = 'train_data_coco.json' if is_train else 'test_data_coco.json'
-            self.work_dir = ''
-            output_file = os.path.join(self.work_dir, fn)
+            output_file = os.path.join(self.config["work_dir"], fn)
             mmcv.dump(coco_format_json, output_file)
             
             print(f"Transformed the dataset into COCO style: {output_file} "
                   f"Num Images {len(images)} and Num Annotations: {len(annotations)}")
         
+            self.set_mmdet_config()
+
+            
     def update_model( self ):
-        self.trainer.train(self._output_dir)
         print( "\nModel training complete!\n" )
 
     def interupt_handler( self ):
