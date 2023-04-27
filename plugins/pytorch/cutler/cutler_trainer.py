@@ -119,7 +119,6 @@ class CutLERTrainer( TrainDetector ):
         if len(self.device) > torch.cuda.device_count():
             self.device = self.device[:torch.cuda.device_count()]
             
-        print(type(self.config['checkpoint_override']))
         if self.config["checkpoint_override"] is not None:
             self.original_chkpt_file = self.config["checkpoint_override"]
         else:
@@ -255,10 +254,7 @@ class CutLERTrainer( TrainDetector ):
         print(f'mmdet Config:\n{mmdet_config.pretty_text}')
 
         mmdet_config.dump(str(os.path.join(self.config["work_dir"], 'mmdet_config.py')))
-        self.mmdet_config = mmdet_config
-        
-        self.load_network() # TODO: I don't think this should be manually called?
-
+        self.mmdet_config = mmdet_config   
 
 
     def check_configuration( self, cfg ):
@@ -268,8 +264,8 @@ class CutLERTrainer( TrainDetector ):
             return False
 
 
-    def load_network( self ):
-        print('load_network')
+    def update_model( self ):
+        print('update_model')
         # seed = np.random.randint(2**31)
         seed = self.config["seed"]
         random.seed(seed)
@@ -406,10 +402,7 @@ class CutLERTrainer( TrainDetector ):
                   f"Num Images {len(images)} and Num Annotations: {len(annotations)}")
         
             self.set_mmdet_config()
-
-            
-    def update_model( self ):
-        print( "\nModel training complete!\n" )
+           
 
     def interupt_handler( self ):
         self.proc.send_signal( signal.SIGINT )
