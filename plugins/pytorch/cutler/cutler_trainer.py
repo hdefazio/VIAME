@@ -38,6 +38,10 @@ import sys
 import time
 import yaml
 import mmcv
+import mmdet
+import random
+import gc
+import shutil
 
 import numpy as np
 import ubelt as ub
@@ -47,7 +51,10 @@ from PIL import Image
 from distutils.util import strtobool
 from shutil import copyfile
 from pathlib import Path
-
+from mmcv.runner import load_checkpoint
+from mmdet.utils import collect_env
+from mmdet.apis import train_detector
+from mmdet.datasets import build_dataset
 from kwiver.vital.algo import DetectedObjectSetOutput, TrainDetector
 from kwiver.vital.types import (
     BoundingBoxD, CategoryHierarchy, DetectedObject, DetectedObjectSet,
@@ -97,6 +104,9 @@ class CutLERTrainer( TrainDetector ):
         config_file = yaml.safe_load(Path(self._config_file).read_text())
         self.config = config_file['params']
         print('config:', self.config)
+        
+        self.ckpt = 0 # TODO: not sure about this
+        self.stage = 'base' # TODO: also not sure about this 
 
         device = self.config['device']
         if ub.iterable(device):
@@ -109,24 +119,23 @@ class CutLERTrainer( TrainDetector ):
         if len(self.device) > torch.cuda.device_count():
             self.device = self.device[:torch.cuda.device_count()]
             
+        print(type(self.config['checkpoint_override']))
         if self.config["checkpoint_override"] is not None:
-            original_chkpt_file = self.config["checkpoint_override"]
+            self.original_chkpt_file = self.config["checkpoint_override"]
         else:
-            original_chkpt_file = self.config["model_checkpoint_file"]
+            self.original_chkpt_file = self.config["model_checkpoint_file"]
             
         if config_file["name"] == "CutLER/pretrain_algo.py":
                 if os.path.exists(str(os.path.join(self.config["work_dir"], "pretrain.pth"))):
-                    original_chkpt_file = os.path.join(self.config["work_dir"], "pretrain.pth")
-        print(f"Found CutLER weights at {original_chkpt_file}")
-
-
+                    self.original_chkpt_file = os.path.join(self.config["work_dir"], "pretrain.pth")
+        print(f"Found CutLER weights at {self.original_chkpt_file}")
 
 
     def set_mmdet_config(self):
         print('set_mmdet_config')
         # based on: https://gitlab.kitware.com/darpa_learn/learn/-/blob/object_detection_2023/learn/algorithms/MMDET/object_detection.py#L478
         # make sure this runs after add_data_from_disk
-        mmdet_config = mmcv.Config.fromfile(f'{learn_dir}/learn/algorithms/MMDET/configs/convnext_extra_large_config.py')
+        mmdet_config = mmcv.Config.fromfile(self.config['mmdet_model_config_file'])
         mmdet_config.dataset_type = 'CocoDataset'
         
         mmdet_config.data_root = self.image_root
@@ -203,16 +212,15 @@ class CutLERTrainer( TrainDetector ):
         mmdet_config.device = 'cuda'
         mmdet_config.work_dir = self.config["work_dir"]
 
-        ckpt = 0 # TODO: not sure about this
-        stage = 'base' # TODO: also not sure about this 
-        if stage == "adapt":
-            if len(self.config["iters_per_ckpt_adapt"]) > 0 and ckpt < len(self.config["iters_per_ckpt_adapt"]):
-                num_iter = self.config["iters_per_ckpt_adapt"][ckpt]
+        
+        if self.stage == "adapt":
+            if len(self.config["iters_per_ckpt_adapt"]) > 0 and self.ckpt < len(self.config["iters_per_ckpt_adapt"]):
+                num_iter = self.config["iters_per_ckpt_adapt"][self.ckpt]
             else:
                 num_iter = self.config["max_iters"]
         else:    
-            if len(self.config["iters_per_ckpt"]) > 0 and ckpt < len(self.config["iters_per_ckpt"]):
-                num_iter = self.config["iters_per_ckpt"][ckpt]
+            if len(self.config["iters_per_ckpt"]) > 0 and self.ckpt < len(self.config["iters_per_ckpt"]):
+                num_iter = self.config["iters_per_ckpt"][self.ckpt]
             else:
                 num_iter = self.config["max_iters"]
 
@@ -248,6 +256,8 @@ class CutLERTrainer( TrainDetector ):
 
         mmdet_config.dump(str(os.path.join(self.config["work_dir"], 'mmdet_config.py')))
         self.mmdet_config = mmdet_config
+        
+        self.load_network() # TODO: I don't think this should be manually called?
 
 
 
@@ -259,42 +269,61 @@ class CutLERTrainer( TrainDetector ):
 
 
     def load_network( self ):
-        """
-        ##### Train an MMDetection model rather than detectron
+        print('load_network')
+        # seed = np.random.randint(2**31)
+        seed = self.config["seed"]
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        self.mmdet_config.seed = seed
+        
         meta = dict()
         env_info_dict = collect_env()
         env_info = '\n'.join([(f'{k}: {v}') for k, v in env_info_dict.items()])
         dash_line = '-' * 60 + '\n'
-        print('Environment info:\n' + dash_line + env_info + '\n' + dash_line)
+        print('Environment info:\n' + dash_line + env_info + '\n' +
+                    dash_line)
         meta['env_info'] = env_info
         meta['config'] = self.mmdet_config.pretty_text
-        meta['seed'] = self.mmdet_config.seed
-
+        meta['seed'] = seed
+        
         print("building dataset")
         datasets = [build_dataset(self.mmdet_config.data.train)]
-
+        
         print("building detector")
-        model = build_detector(
+        model = mmdet.models.build_detector(
             self.mmdet_config.model, train_cfg=self.mmdet_config.get('train_cfg'), test_cfg=self.mmdet_config.get('test_cfg')
         )
-
+        
         checkpoint_file = self.original_chkpt_file
         chkpt = load_checkpoint(model, checkpoint_file)
 
         print("training model")
-
+        
         model.train()
         train_detector(model, datasets, self.mmdet_config, distributed=False, validate=False, meta=meta)
-
-
-        print("finished training")
+        
         self.model = model
-        save_checkpoint(model, os.path.join(self.work_dir, "pretrain.pth"))
+        
+        if self.config["save_model_every_ckpt"]:
+            if os.path.exists(os.path.join(self.config["work_dir"], "latest.pth")):
+                fname = str(self.stage) + "_" + str(self.ckpt) + "_model.pth"
+                shutil.copy(os.path.join(self.config["work_dir"], "latest.pth"), os.path.join(self.config["work_dir"], fname))
+
+        if self.config["eval_train_set"]:
+            if os.path.exists(os.path.join(self.work_dir, "latest.pth")):
+                fname = str(self.stage) + "_" + str(self.ckpt) + "_model.pth"
+                shutil.copy(os.path.join(self.work_dir, "latest.pth"), os.path.join(self.work_dir, fname))
+            
+            fname = str(self.stage) + "_" + str(self.ckpt) + "_train_data_coco.json"
+            if os.path.exists(os.path.join(self.work_dir, "train_data_coco.json")):
+                shutil.copy(os.path.join(self.work_dir, "train_data_coco.json"), os.path.join(self.work_dir, fname))
 
         gc.collect()  # Make sure all object have ben deallocated if not used
         torch.cuda.empty_cache()
         return
-        """
+
 
     def add_data_from_disk( self, categories, train_files, train_dets, test_files, test_dets ):
         print('add_data_from_disk')
