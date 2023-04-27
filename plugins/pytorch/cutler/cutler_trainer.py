@@ -141,7 +141,7 @@ class CutLERTrainer( TrainDetector ):
         mmdet_config.data_root = self.image_root
         mmdet_config.data.ann_file = str(os.path.join(self.config["work_dir"], 'train_data_coco.json'))
         
-        mmdet_config.classes = ("maskcut", ) # default class from maskcut
+        mmdet_config.classes = tuple(self.cats)
 
         # print(type(mmdet_config)) # <class 'mmcv.utils.config.Config'>
 
@@ -333,7 +333,8 @@ class CutLERTrainer( TrainDetector ):
             return
         
         cats = []
-        for cat in categories.all_class_names():
+        self.cats = categories.all_class_names()
+        for cat in self.cats:
             cat_id = categories.get_class_id(cat)
             cats.append({'name': cat, 'id': int(cat_id)})
 
