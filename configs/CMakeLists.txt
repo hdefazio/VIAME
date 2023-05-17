@@ -455,7 +455,8 @@ endif()
 
 if( VIAME_ENABLE_PYTORCH-CUTLER )
   set( CORE_PIPELINE_FILES ${CORE_PIPELINE_FILES}
-    pipelines/detector_maskcut.pipe )
+    pipelines/detector_maskcut.pipe 
+    pipelines/train_detector_cutler.viame_csv.conf )
 endif()
 
 if( VIAME_ENABLE_PYTORCH AND VIAME_ENABLE_PYTORCH-PYSOT )
